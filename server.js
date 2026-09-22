@@ -140,9 +140,9 @@ async function sendMetaPurchase({
   clientIpAddress = "",
   clientUserAgent = "",
 }) {
-  const pixelId = requiredEnv("META_PIXEL_ID");
-  const accessToken = requiredEnv("META_ACCESS_TOKEN");
-  const graphVersion = process.env.META_GRAPH_VERSION || "v26.0";
+  const pixelId = requiredEnv("META_PIXEL_ID").trim().replace(/^["']|["']$/g, "");
+  const accessToken = requiredEnv("META_ACCESS_TOKEN").trim().replace(/^["']|["']$/g, "");
+  const graphVersion = String(process.env.META_GRAPH_VERSION || "v26.0").trim();
 
   const normalizedEmail = normalizeMetaEmail(email);
   const normalizedPhone = normalizeMetaPhone(phone);
@@ -195,7 +195,9 @@ async function sendMetaPurchase({
   };
 
   if (process.env.META_TEST_EVENT_CODE) {
-    payload.test_event_code = process.env.META_TEST_EVENT_CODE;
+    payload.test_event_code = String(process.env.META_TEST_EVENT_CODE)
+      .trim()
+      .replace(/^["']|["']$/g, "");
   }
 
   const response = await fetch(
@@ -593,13 +595,127 @@ app.get("/test-shopify-auth", async (req, res) => {
 
 
 app.get("/test-meta-config", (req, res) => {
+  const normalizedPixelId = String(process.env.META_PIXEL_ID || "")
+    .trim()
+    .replace(/^["']|["']$/g, "");
+
+  const normalizedTestCode = String(process.env.META_TEST_EVENT_CODE || "")
+    .trim()
+    .replace(/^["']|["']$/g, "");
+
   res.json({
     ok: true,
-    pixel_id: process.env.META_PIXEL_ID || null,
-    access_token_configured: Boolean(process.env.META_ACCESS_TOKEN),
-    graph_version: process.env.META_GRAPH_VERSION || "v26.0",
-    test_event_code_configured: Boolean(process.env.META_TEST_EVENT_CODE),
+    pixel_id: normalizedPixelId || null,
+    pixel_id_matches_mypiano: normalizedPixelId === "2169347980686872",
+    access_token_configured: Boolean(String(process.env.META_ACCESS_TOKEN || "").trim()),
+    graph_version: String(process.env.META_GRAPH_VERSION || "v26.0").trim(),
+    test_event_code_configured: Boolean(normalizedTestCode),
+    test_event_code_length: normalizedTestCode.length,
+    test_event_code_matches_expected: normalizedTestCode === "TEST98302",
   });
+});
+
+
+app.get("/test-meta-hard", async (req, res) => {
+  try {
+    /*
+      Diagnostic only:
+      - bypasses META_PIXEL_ID and META_TEST_EVENT_CODE environment values
+      - targets the exact MyPiano dataset and exact current test code
+      - sends TWO events in one request so we can distinguish a routing issue
+        from a Purchase-specific issue
+    */
+    const pixelId = "2169347980686872";
+    const testEventCode = "TEST98302";
+    const accessToken = requiredEnv("META_ACCESS_TOKEN")
+      .trim()
+      .replace(/^["']|["']$/g, "");
+    const graphVersion = String(process.env.META_GRAPH_VERSION || "v26.0").trim();
+    const now = Math.floor(Date.now() / 1000);
+    const requestIp = getRequestIp(req);
+    const userAgent = req.headers["user-agent"] || "";
+    const externalId = sha256(`mypiano-debug-${Date.now()}`);
+
+    const commonUserData = {
+      external_id: [externalId],
+    };
+
+    if (requestIp) commonUserData.client_ip_address = requestIp;
+    if (userAgent) commonUserData.client_user_agent = userAgent;
+
+    const payload = {
+      data: [
+        {
+          event_name: "PageView",
+          event_time: now,
+          event_id: `mypiano_debug_pageview_${Date.now()}`,
+          action_source: "website",
+          event_source_url: "https://mypiano.ge",
+          user_data: commonUserData,
+        },
+        {
+          event_name: "Purchase",
+          event_time: now,
+          event_id: `mypiano_debug_purchase_${Date.now()}`,
+          action_source: "website",
+          event_source_url: "https://mypiano.ge",
+          user_data: commonUserData,
+          custom_data: {
+            currency: "GEL",
+            value: 1,
+            content_name: "MyPiano Hard Diagnostic Purchase",
+            content_type: "product",
+            content_ids: ["mypiano-debug"],
+            contents: [
+              {
+                id: "mypiano-debug",
+                quantity: 1,
+                item_price: 1,
+              },
+            ],
+            payment_method: "diagnostic",
+          },
+        },
+      ],
+      test_event_code: testEventCode,
+    };
+
+    const response = await fetch(
+      `https://graph.facebook.com/${graphVersion}/${pixelId}/events?access_token=${encodeURIComponent(accessToken)}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      }
+    );
+
+    const responseText = await response.text();
+
+    let metaResponse;
+    try {
+      metaResponse = JSON.parse(responseText);
+    } catch {
+      metaResponse = { raw: responseText };
+    }
+
+    console.log("META HARD TEST RESPONSE:", responseText);
+
+    return res.status(response.ok ? 200 : 500).json({
+      ok: response.ok,
+      sent_to_pixel: pixelId,
+      sent_test_event_code: testEventCode,
+      sent_events: ["PageView", "Purchase"],
+      meta: metaResponse,
+    });
+  } catch (error) {
+    console.error("Meta hard test error:", error);
+    return res.status(500).json({
+      ok: false,
+      error: error.message,
+    });
+  }
 });
 
 app.get("/test-meta-purchase", async (req, res) => {

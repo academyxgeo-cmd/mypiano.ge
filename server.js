@@ -40,6 +40,183 @@ function normalizeGeorgianPhone(phone = "") {
   return cleaned;
 }
 
+
+function sha256(value = "") {
+  return crypto
+    .createHash("sha256")
+    .update(String(value).trim().toLowerCase())
+    .digest("hex");
+}
+
+function normalizeMetaEmail(email = "") {
+  return String(email || "").trim().toLowerCase();
+}
+
+function normalizeMetaPhone(phone = "") {
+  return normalizeGeorgianPhone(phone).replace(/\D/g, "");
+}
+
+const MYPIANO_ALLOWED_ORIGINS = new Set([
+  "https://mypiano.ge",
+  "https://www.mypiano.ge",
+]);
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && MYPIANO_ALLOWED_ORIGINS.has(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  }
+  if (req.method === "OPTIONS") {
+    if (origin && !MYPIANO_ALLOWED_ORIGINS.has(origin)) return res.sendStatus(403);
+    return res.sendStatus(204);
+  }
+  next();
+});
+
+function getRequestIp(req) {
+  const forwarded = req.headers["x-forwarded-for"];
+  if (typeof forwarded === "string" && forwarded.trim()) {
+    return forwarded.split(",")[0].trim();
+  }
+  return req.socket?.remoteAddress || "";
+}
+
+function isMyPianoRequest(req) {
+  const origin = String(req.headers.origin || "");
+  const referer = String(req.headers.referer || "");
+  if (MYPIANO_ALLOWED_ORIGINS.has(origin)) return true;
+  return (
+    referer === "https://mypiano.ge/" ||
+    referer.startsWith("https://mypiano.ge/") ||
+    referer === "https://www.mypiano.ge/" ||
+    referer.startsWith("https://www.mypiano.ge/")
+  );
+}
+
+function parseJsonArray(value) {
+  if (Array.isArray(value)) return value;
+  if (typeof value !== "string" || !value.trim()) return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+const metaPurchaseRate = new Map();
+function allowMetaPurchaseRequest(ip) {
+  const now = Date.now();
+  const windowMs = 10 * 60 * 1000;
+  const maxRequests = 20;
+  const previous = metaPurchaseRate.get(ip) || [];
+  const fresh = previous.filter((time) => now - time < windowMs);
+  if (fresh.length >= maxRequests) {
+    metaPurchaseRate.set(ip, fresh);
+    return false;
+  }
+  fresh.push(now);
+  metaPurchaseRate.set(ip, fresh);
+  return true;
+}
+
+async function sendMetaPurchase({
+  shopifyOrderId = "",
+  eventId = "",
+  value,
+  currency = "GEL",
+  email = "",
+  phone = "",
+  paymentMethod = "",
+  contentName = "",
+  contentIds = [],
+  contents = [],
+  eventSourceUrl = "https://mypiano.ge",
+  fbp = "",
+  fbc = "",
+  clientIpAddress = "",
+  clientUserAgent = "",
+}) {
+  const pixelId = requiredEnv("META_PIXEL_ID");
+  const accessToken = requiredEnv("META_ACCESS_TOKEN");
+  const graphVersion = process.env.META_GRAPH_VERSION || "v26.0";
+
+  const normalizedEmail = normalizeMetaEmail(email);
+  const normalizedPhone = normalizeMetaPhone(phone);
+  const userData = {};
+
+  if (normalizedEmail) userData.em = [sha256(normalizedEmail)];
+  if (normalizedPhone) userData.ph = [sha256(normalizedPhone)];
+  if (fbp) userData.fbp = String(fbp).slice(0, 255);
+  if (fbc) userData.fbc = String(fbc).slice(0, 255);
+  if (clientIpAddress) userData.client_ip_address = String(clientIpAddress).slice(0, 100);
+  if (clientUserAgent) userData.client_user_agent = String(clientUserAgent).slice(0, 1000);
+
+  const cleanValue = Number(value);
+  if (!Number.isFinite(cleanValue) || cleanValue <= 0) {
+    throw new Error(`Invalid Meta Purchase value: ${value}`);
+  }
+
+  const finalEventId = eventId ||
+    (shopifyOrderId ? `purchase_${shopifyOrderId}` : `mypiano_purchase_${crypto.randomUUID()}`);
+
+  const customData = {
+    currency,
+    value: cleanValue,
+    payment_method: paymentMethod,
+  };
+  if (shopifyOrderId) customData.order_id = String(shopifyOrderId);
+  if (contentName) customData.content_name = String(contentName).slice(0, 500);
+  if (Array.isArray(contentIds) && contentIds.length) {
+    customData.content_ids = contentIds.slice(0, 20).map((id) => String(id).slice(0, 128));
+    customData.content_type = "product";
+  }
+  if (Array.isArray(contents) && contents.length) {
+    customData.contents = contents.slice(0, 20).map((item) => ({
+      id: String(item?.id || "").slice(0, 128),
+      quantity: Math.max(1, Number(item?.quantity || 1)),
+      item_price: Math.max(0, Number(item?.item_price || 0)),
+    }));
+  }
+
+  const payload = {
+    data: [{
+      event_name: "Purchase",
+      event_time: Math.floor(Date.now() / 1000),
+      event_id: finalEventId,
+      action_source: "website",
+      event_source_url: eventSourceUrl,
+      user_data: userData,
+      custom_data: customData,
+    }],
+  };
+
+  if (process.env.META_TEST_EVENT_CODE) {
+    payload.test_event_code = process.env.META_TEST_EVENT_CODE;
+  }
+
+  const response = await fetch(
+    `https://graph.facebook.com/${graphVersion}/${pixelId}/events?access_token=${encodeURIComponent(accessToken)}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }
+  );
+
+  const responseText = await response.text();
+  if (!response.ok) throw new Error(`Meta CAPI failed: ${responseText}`);
+
+  console.log(`META PURCHASE SENT | event_id=${finalEventId} | ${cleanValue} ${currency} | ${paymentMethod}`);
+  console.log("META CAPI RESPONSE:", responseText);
+
+  try { return JSON.parse(responseText); }
+  catch { return { raw: responseText }; }
+}
+
 function formatGel(amount) {
   const n = Number(amount || 0);
   return `${n.toFixed(2).replace(".00", "")} ₾`;
@@ -123,6 +300,11 @@ async function getShopifyOrder(orderId) {
           id
           name
           displayFinancialStatus
+          email
+          phone
+          shippingAddress {
+            phone
+          }
           totalOutstandingSet {
             shopMoney {
               amount
@@ -364,6 +546,8 @@ app.get("/", (req, res) => {
     <p><a href="/test-bog-auth">Test BOG Auth</a></p>
     <p><a href="/test-shopify-auth">Test Shopify Auth</a></p>
     <p><a href="/test-payment">Create 1 GEL Test Payment</a></p>
+    <p><a href="/test-meta-config">Test Meta Config</a></p>
+    <p><a href="/test-meta-purchase">Send Meta Test Purchase</a></p>
     <p>Direct checkout endpoint: <code>/checkout?variant_id=SHOPIFY_VARIANT_ID&quantity=1</code></p>
   `);
 });
@@ -404,6 +588,119 @@ app.get("/test-shopify-auth", async (req, res) => {
     });
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+
+app.get("/test-meta-config", (req, res) => {
+  res.json({
+    ok: true,
+    pixel_id: process.env.META_PIXEL_ID || null,
+    access_token_configured: Boolean(process.env.META_ACCESS_TOKEN),
+    graph_version: process.env.META_GRAPH_VERSION || "v26.0",
+    test_event_code_configured: Boolean(process.env.META_TEST_EVENT_CODE),
+  });
+});
+
+app.get("/test-meta-purchase", async (req, res) => {
+  try {
+    const result = await sendMetaPurchase({
+      eventId: `mypiano_test_${Date.now()}`,
+      value: 1,
+      currency: "GEL",
+      paymentMethod: "test",
+      contentName: "MyPiano Meta CAPI Test",
+      contentIds: ["mypiano-test"],
+      contents: [{ id: "mypiano-test", quantity: 1, item_price: 1 }],
+      eventSourceUrl: "https://mypiano.ge",
+      clientIpAddress: getRequestIp(req),
+      clientUserAgent: req.headers["user-agent"] || "",
+    });
+    return res.json({ ok: true, meta: result });
+  } catch (error) {
+    console.error("Meta test purchase error:", error);
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.post("/api/meta/purchase", async (req, res) => {
+  try {
+    console.log("META PURCHASE REQUEST:", JSON.stringify({
+      origin: req.headers.origin || "",
+      referer: req.headers.referer || "",
+      contentType: req.headers["content-type"] || "",
+      body: req.body || {},
+    }));
+
+    if (!isMyPianoRequest(req)) {
+      console.log("META PURCHASE REJECTED: source is not MyPiano");
+      return res.status(403).json({ ok: false, error: "Source not allowed" });
+    }
+
+    const ip = getRequestIp(req);
+    if (!allowMetaPurchaseRequest(ip || "unknown")) {
+      return res.status(429).json({ ok: false, error: "Too many requests" });
+    }
+
+    const {
+      event_id,
+      value,
+      currency = "GEL",
+      phone = "",
+      payment_method = "",
+      content_name = "",
+      content_ids = [],
+      contents = [],
+      event_source_url = "https://mypiano.ge",
+      fbp = "",
+      fbc = "",
+    } = req.body || {};
+
+    const cleanValue = Number(value);
+    const parsedContentIds = parseJsonArray(content_ids);
+    const parsedContents = parseJsonArray(contents);
+
+    if (!event_id || !String(event_id).startsWith("mypiano_purchase_")) {
+      return res.status(400).json({ ok: false, error: "Invalid event_id" });
+    }
+    if (!Number.isFinite(cleanValue) || cleanValue <= 0 || cleanValue > 1000000) {
+      return res.status(400).json({ ok: false, error: "Invalid value" });
+    }
+
+    const allowedMethods = new Set(["ნაღდი ანგარიშსწორება", "cash"]);
+    if (!allowedMethods.has(payment_method)) {
+      return res.status(400).json({ ok: false, error: "Invalid payment method" });
+    }
+
+    let sourceUrl = String(event_source_url || "https://mypiano.ge");
+    if (
+      !sourceUrl.startsWith("https://mypiano.ge/") &&
+      sourceUrl !== "https://mypiano.ge" &&
+      !sourceUrl.startsWith("https://www.mypiano.ge/")
+    ) {
+      sourceUrl = "https://mypiano.ge";
+    }
+
+    const result = await sendMetaPurchase({
+      eventId: String(event_id).slice(0, 200),
+      value: cleanValue,
+      currency: "GEL",
+      phone,
+      paymentMethod: payment_method,
+      contentName: content_name,
+      contentIds: parsedContentIds,
+      contents: parsedContents,
+      eventSourceUrl: sourceUrl,
+      fbp,
+      fbc,
+      clientIpAddress: ip,
+      clientUserAgent: req.headers["user-agent"] || "",
+    });
+
+    return res.json({ ok: true, meta: result });
+  } catch (error) {
+    console.error("Meta purchase endpoint error:", error);
+    return res.status(500).json({ ok: false, error: error.message });
   }
 });
 
@@ -760,17 +1057,44 @@ app.post("/api/bog/callback", async (req, res) => {
     const status = body.order_status?.key || body.status;
     const externalOrderId = body.external_order_id;
 
-    let shopifyOrderGid = null;
-
-    if (externalOrderId?.startsWith("MP-")) {
-      const numericOrderId = externalOrderId.replace("MP-", "");
-      shopifyOrderGid = `gid://shopify/Order/${numericOrderId}`;
+    if (status !== "completed") {
+      return res.sendStatus(200);
     }
 
-    if (status === "completed" && shopifyOrderGid) {
+    const match = String(externalOrderId || "").match(/^MP-(\d+)$/);
+    if (!match) {
+      console.log("BOG callback ignored: invalid/non-production external_order_id");
+      return res.sendStatus(200);
+    }
+
+    const numericOrderId = match[1];
+    const shopifyOrderGid = `gid://shopify/Order/${numericOrderId}`;
+    let order = await getShopifyOrder(numericOrderId);
+
+    if (order.displayFinancialStatus !== "PAID") {
       const paidOrder = await markShopifyOrderAsPaid(shopifyOrderGid);
       console.log("Shopify order marked as paid:", paidOrder);
+      order = await getShopifyOrder(numericOrderId);
+    } else {
+      console.log("Shopify order already paid:", order.name);
     }
+
+    const total = order.currentTotalPriceSet?.shopMoney;
+    const amount = Number(total?.amount || 0);
+    const currency = total?.currencyCode || "GEL";
+    const phone = order.phone || order.shippingAddress?.phone || "";
+
+    await sendMetaPurchase({
+      shopifyOrderId: numericOrderId,
+      eventId: `mypiano_purchase_bog_${numericOrderId}`,
+      value: amount,
+      currency,
+      email: order.email || "",
+      phone,
+      paymentMethod: "ბარათი / განვადება",
+      contentName: order.name || `MyPiano order ${numericOrderId}`,
+      eventSourceUrl: "https://mypiano.ge",
+    });
 
     return res.sendStatus(200);
   } catch (error) {

@@ -412,6 +412,18 @@ async function getShopifyOrder(orderId) {
               currencyCode
             }
           }
+          currentSubtotalPriceSet {
+            shopMoney {
+              amount
+              currencyCode
+            }
+          }
+          currentShippingPriceSet {
+            shopMoney {
+              amount
+              currencyCode
+            }
+          }
           currentTotalPriceSet {
             shopMoney {
               amount
@@ -548,39 +560,78 @@ async function createBogOrderForShopifyOrder(orderId, order) {
 
   const outstanding = order.totalOutstandingSet?.shopMoney;
   const currentTotal = order.currentTotalPriceSet?.shopMoney;
+  const currentSubtotal = order.currentSubtotalPriceSet?.shopMoney;
+  const currentShipping = order.currentShippingPriceSet?.shopMoney;
 
   const amount =
     outstanding?.amount && Number(outstanding.amount) > 0
-      ? outstanding.amount
-      : currentTotal.amount;
+      ? Number(outstanding.amount)
+      : Number(currentTotal?.amount || 0);
 
-  const currency = outstanding?.currencyCode || currentTotal.currencyCode || "GEL";
+  const currency =
+    outstanding?.currencyCode ||
+    currentTotal?.currencyCode ||
+    currentSubtotal?.currencyCode ||
+    currentShipping?.currencyCode ||
+    "GEL";
 
   if (currency !== "GEL") {
     throw new Error(`Unsupported currency: ${currency}. BOG needs GEL.`);
   }
 
+  const shippingAmount = Math.max(0, Number(currentShipping?.amount || 0));
+  let productAmount = Number(currentSubtotal?.amount);
+
+  // Fallback for any Shopify response that does not include subtotal.
+  if (!Number.isFinite(productAmount)) {
+    productAmount = Math.max(0, amount - shippingAmount);
+  }
+
+  if (!Number.isFinite(amount) || amount <= 0) {
+    throw new Error("Invalid Shopify order total for BOG payment");
+  }
+
+  // BOG has a dedicated purchase_units.delivery.amount field.
+  // Before shipping profiles were added, total_amount and basket unit_price were
+  // identical because delivery was 0. Once delivery became non-zero, sending the
+  // whole total as a product price no longer represented the real order.
+  const purchaseUnits = {
+    currency: "GEL",
+    total_amount: amount,
+    basket: [
+      {
+        product_id: `shopify-${orderId}`,
+        description: `MyPiano order ${order.name}`,
+        quantity: 1,
+        unit_price: productAmount,
+        total_price: productAmount,
+      },
+    ],
+  };
+
+  if (shippingAmount > 0) {
+    purchaseUnits.delivery = {
+      amount: shippingAmount,
+    };
+  }
+
   const payload = {
     callback_url: `${appUrl}/api/bog/callback`,
     external_order_id: `MP-${orderId}`.slice(0, 25),
-    purchase_units: {
-      currency: "GEL",
-      total_amount: Number(amount),
-      basket: [
-        {
-          product_id: `shopify-${orderId}`,
-          description: `MyPiano order ${order.name}`,
-          quantity: 1,
-          unit_price: Number(amount),
-        },
-      ],
-    },
+    purchase_units: purchaseUnits,
     redirect_urls: {
       success: `${appUrl}/payment-success?order=${encodeURIComponent(order.name)}`,
       fail: `${appUrl}/payment-failed?order=${encodeURIComponent(order.name)}`,
     },
     ttl: 30,
   };
+
+  console.log("BOG CREATE:", JSON.stringify({
+    external_order_id: payload.external_order_id,
+    total_amount: amount,
+    product_amount: productAmount,
+    delivery_amount: shippingAmount,
+  }));
 
   const response = await fetch(BOG_CREATE_ORDER_URL, {
     method: "POST",

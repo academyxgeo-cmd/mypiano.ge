@@ -292,6 +292,105 @@ async function shopifyGraphQL(query, variables = {}) {
   return json.data;
 }
 
+
+function toShopifyVariantGid(variantId) {
+  const raw = String(variantId || "").trim();
+  if (!raw) throw new Error("Missing Shopify variant ID");
+  return raw.startsWith("gid://shopify/ProductVariant/")
+    ? raw
+    : `gid://shopify/ProductVariant/${raw}`;
+}
+
+function normalizeShippingItems(items = []) {
+  if (!Array.isArray(items) || !items.length) {
+    throw new Error("At least one shipping line item is required");
+  }
+
+  return items.map((item) => {
+    const quantity = Math.max(1, Number(item.quantity || 1));
+    const variantId = item.variantId ?? item.variant_id;
+
+    if (!variantId) throw new Error("Missing variant ID in shipping line item");
+
+    return {
+      variantId: toShopifyVariantGid(variantId),
+      quantity,
+    };
+  });
+}
+
+async function getShopifyShippingRate({
+  items,
+  city = "Tbilisi",
+  address1 = "Tbilisi",
+}) {
+  const query = `
+    query AvailableDeliveryOptions($input: DraftOrderAvailableDeliveryOptionsInput!) {
+      draftOrderAvailableDeliveryOptions(input: $input) {
+        availableShippingRates {
+          handle
+          title
+          code
+          source
+          price {
+            amount
+            currencyCode
+          }
+        }
+      }
+    }
+  `;
+
+  const lineItems = normalizeShippingItems(items);
+  const cleanCity = String(city || "Tbilisi").trim() || "Tbilisi";
+  const cleanAddress = String(address1 || "Tbilisi").trim() || "Tbilisi";
+
+  const data = await shopifyGraphQL(query, {
+    input: {
+      lineItems,
+      shippingAddress: {
+        city: cleanCity,
+        address1: cleanAddress,
+        countryCode: "GE",
+      },
+      marketRegionCountryCode: "GE",
+    },
+  });
+
+  const rates =
+    data.draftOrderAvailableDeliveryOptions?.availableShippingRates || [];
+
+  if (!rates.length) {
+    throw new Error("No Shopify shipping rate is available for this order in Georgia");
+  }
+
+  const gelRates = rates.filter(
+    (rate) => rate?.price?.currencyCode === "GEL"
+  );
+
+  const candidates = gelRates.length ? gelRates : rates;
+
+  // If multiple valid options exist, use the lowest priced one.
+  // With the current MyPiano profiles there is one Standard rate per applicable profile.
+  const selected = [...candidates].sort(
+    (a, b) => Number(a?.price?.amount || 0) - Number(b?.price?.amount || 0)
+  )[0];
+
+  const price = Number(selected?.price?.amount || 0);
+  if (!Number.isFinite(price) || price < 0) {
+    throw new Error("Shopify returned an invalid shipping price");
+  }
+
+  return {
+    handle: selected.handle,
+    title: selected.title || "Delivery",
+    code: selected.code || "delivery",
+    source: selected.source || "shopify",
+    price,
+    currency: selected.price?.currencyCode || "GEL",
+  };
+}
+
 async function getShopifyOrder(orderId) {
   const gid = `gid://shopify/Order/${orderId}`;
 
@@ -370,11 +469,16 @@ async function createPendingShopifyOrder({
   email,
   city,
   address1,
+  shippingRate,
 }) {
   const shop = requiredEnv("SHOPIFY_SHOP");
   const token = await getShopifyToken();
   const cleanQuantity = Math.max(1, Number(quantity || 1));
   const normalizedPhone = normalizeGeorgianPhone(phone);
+
+  if (!shippingRate || !Number.isFinite(Number(shippingRate.price))) {
+    throw new Error("Missing calculated Shopify shipping rate");
+  }
 
   const payload = {
     order: {
@@ -409,9 +513,9 @@ async function createPendingShopifyOrder({
       },
       shipping_lines: [
         {
-          title: "Delivery",
-          price: "0.00",
-          code: "delivery",
+          title: shippingRate.title || "Delivery",
+          price: Number(shippingRate.price).toFixed(2),
+          code: shippingRate.code || "delivery",
         },
       ],
       send_receipt: false,
@@ -428,11 +532,13 @@ async function createPendingShopifyOrder({
     body: JSON.stringify(payload),
   });
 
-  const text = await response.text();
+  const responseText = await response.text();
 
-  if (!response.ok) throw new Error(`Shopify order create failed: ${text}`);
+  if (!response.ok) {
+    throw new Error(`Shopify order create failed: ${responseText}`);
+  }
 
-  return JSON.parse(text).order;
+  return JSON.parse(responseText).order;
 }
 
 async function createBogOrderForShopifyOrder(orderId, order) {
@@ -839,6 +945,39 @@ app.get("/test-payment", async (req, res) => {
   }
 });
 
+
+app.post("/api/shipping-rate", async (req, res) => {
+  try {
+    if (!isMyPianoRequest(req)) {
+      return res.status(403).json({ ok: false, error: "Forbidden" });
+    }
+
+    const rawItems = Array.isArray(req.body?.items) ? req.body.items : [];
+    const city = req.body?.city || "Tbilisi";
+    const address1 = req.body?.address1 || "Tbilisi";
+
+    const items = rawItems.map((item) => ({
+      variantId: item.variantId ?? item.variant_id,
+      quantity: Math.max(1, Number(item.quantity || 1)),
+    }));
+
+    const shipping = await getShopifyShippingRate({ items, city, address1 });
+
+    return res.json({
+      ok: true,
+      shipping: {
+        title: shipping.title,
+        code: shipping.code,
+        price: shipping.price,
+        currency: shipping.currency,
+      },
+    });
+  } catch (error) {
+    console.error("Shipping rate error:", error);
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
 app.get("/checkout", async (req, res) => {
   try {
     const variantId = req.query.variant_id;
@@ -855,7 +994,14 @@ app.get("/checkout", async (req, res) => {
       imageUrl: req.query.image_url || "",
     };
 
-    const total = productInfo.price * quantity;
+    const subtotal = productInfo.price * quantity;
+    const previewShipping = await getShopifyShippingRate({
+      items: [{ variantId, quantity }],
+      city: "Tbilisi",
+      address1: "Tbilisi",
+    });
+    const shippingPrice = Number(previewShipping.price || 0);
+    const total = subtotal + shippingPrice;
 
     res.send(`
       <!doctype html>
@@ -1075,6 +1221,8 @@ app.get("/checkout", async (req, res) => {
                 }
                 <div class="summary-row"><span>ფასი</span><strong>${formatGel(productInfo.price)}</strong></div>
                 <div class="summary-row"><span>რაოდენობა</span><strong>${quantity}</strong></div>
+                <div class="summary-row"><span>პროდუქტები</span><strong>${formatGel(subtotal)}</strong></div>
+                <div class="summary-row"><span>მიწოდება</span><strong>${formatGel(shippingPrice)}</strong></div>
                 <div class="summary-row total"><span>ჯამი</span><span>${formatGel(total)}</span></div>
               </section>
               <section class="card checkout-card">
@@ -1086,7 +1234,7 @@ app.get("/checkout", async (req, res) => {
                   <div>→</div>
                 </div>
                 <h1>შეკვეთის გაფორმება</h1>
-                <p class="lead">შეავსეთ მონაცემები. შემდეგ გადახვალთ საქართველოს ბანკის დაცულ გვერდზე და გადაიხდით ბარათით.</p>
+                <p class="lead">შეავსეთ მონაცემები. შემდეგ გადახვალთ საქართველოს ბანკის დაცულ გვერდზე, სადაც შეძლებთ ბარათით გადახდას ან ხელმისაწვდომი განვადების არჩევას.</p>
                 <form method="POST" action="/checkout">
                   <input type="hidden" name="variant_id" value="${escapeHtml(variantId)}" />
                   <input type="hidden" name="quantity" value="${escapeHtml(quantity)}" />
@@ -1101,9 +1249,9 @@ app.get("/checkout", async (req, res) => {
                     <div class="field"><label>მისამართი</label><input name="address1" autocomplete="street-address" required /></div>
                   </div>
                   <button class="pay-button" type="submit">
-                    გადახდა საქართველოს ბანკით${total > 0 ? ` — ${formatGel(total)}` : ""}
+                    ბარათით გადახდა / განვადება${total > 0 ? ` — ${formatGel(total)}` : ""}
                   </button>
-                  <div class="fine-print">გადახდის ღილაკზე დაჭერის შემდეგ შეიქმნება შეკვეთა და ავტომატურად გადახვალთ საქართველოს ბანკის გვერდზე.</div>
+                  <div class="fine-print">ღილაკზე დაჭერის შემდეგ შეიქმნება შეკვეთა და გადახვალთ საქართველოს ბანკის დაცულ გვერდზე გადახდის მეთოდის ასარჩევად.</div>
                 </form>
               </section>
             </div>
@@ -1134,6 +1282,14 @@ app.post("/checkout", async (req, res) => {
       return res.status(400).send("Missing required checkout fields");
     }
 
+    // Recalculate shipping on the server using the real customer address.
+    // Never trust a delivery amount coming from the browser.
+    const shippingRate = await getShopifyShippingRate({
+      items: [{ variantId: variant_id, quantity }],
+      city,
+      address1,
+    });
+
     const createdOrder = await createPendingShopifyOrder({
       variantId: variant_id,
       quantity,
@@ -1143,6 +1299,7 @@ app.post("/checkout", async (req, res) => {
       email,
       city,
       address1,
+      shippingRate,
     });
 
     const numericOrderId = createdOrder.id;

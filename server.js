@@ -31,13 +31,33 @@ function escapeHtml(value = "") {
 }
 
 function normalizeGeorgianPhone(phone = "") {
-  const cleaned = String(phone).replace(/[^\d+]/g, "");
+  let digits = String(phone || "").trim().replace(/\D/g, "");
 
-  if (cleaned.startsWith("+")) return cleaned;
-  if (cleaned.startsWith("995")) return `+${cleaned}`;
-  if (cleaned.startsWith("5") && cleaned.length === 9) return `+995${cleaned}`;
+  if (!digits) return "";
 
-  return cleaned;
+  // Accept international prefix written as 00, e.g. 00995599123456.
+  if (digits.startsWith("00")) digits = digits.slice(2);
+
+  // Accept common local Georgian form with a leading zero, e.g. 0599123456.
+  if (digits.length === 10 && digits.startsWith("0")) {
+    digits = digits.slice(1);
+  }
+
+  // Full Georgian international number: 995 + 9 national digits.
+  if (digits.startsWith("995")) {
+    const nationalNumber = digits.slice(3);
+    if (/^\d{9}$/.test(nationalNumber)) {
+      return `+995${nationalNumber}`;
+    }
+    return "";
+  }
+
+  // Georgian local/national number: exactly 9 digits.
+  if (/^\d{9}$/.test(digits)) {
+    return `+995${digits}`;
+  }
+
+  return "";
 }
 
 
@@ -487,6 +507,12 @@ async function createPendingShopifyOrder({
   const token = await getShopifyToken();
   const cleanQuantity = Math.max(1, Number(quantity || 1));
   const normalizedPhone = normalizeGeorgianPhone(phone);
+
+  if (!normalizedPhone) {
+    throw new Error(
+      "ტელეფონის ნომერი არასწორია. ჩაწერე 9 ციფრი, მაგალითად 599123456, ან +995 ფორმატით."
+    );
+  }
 
   if (!shippingRate || !Number.isFinite(Number(shippingRate.price))) {
     throw new Error("Missing calculated Shopify shipping rate");
@@ -1293,7 +1319,7 @@ app.get("/checkout", async (req, res) => {
                     <div class="field"><label>სახელი</label><input name="first_name" autocomplete="given-name" required /></div>
                     <div class="field"><label>გვარი</label><input name="last_name" autocomplete="family-name" required /></div>
                   </div>
-                  <div class="field"><label>ტელეფონი</label><input name="phone" autocomplete="tel" required placeholder="მაგ: 599123456" /></div>
+                  <div class="field"><label>ტელეფონი</label><input name="phone" type="tel" inputmode="tel" autocomplete="tel" required maxlength="20" pattern="[0-9+() .-]{9,20}" placeholder="მაგ: 599 12 34 56" /></div>
                   <div class="field"><label>ელფოსტა</label><input name="email" type="email" autocomplete="email" placeholder="example@mail.com" /></div>
                   <div class="grid-2">
                     <div class="field"><label>ქალაქი</label><input name="city" autocomplete="address-level2" required /></div>

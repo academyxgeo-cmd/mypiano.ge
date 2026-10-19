@@ -1018,13 +1018,33 @@ app.post("/api/vitvli-contact", async (req, res) => {
       return res.status(400).json({ ok: false, error: "Missing contact form fields" });
     }
 
+    const vitvliFields = [];
+
+    Object.entries(payload.fields).forEach(([key, rawValue]) => {
+      const values = Array.isArray(rawValue) ? rawValue : [rawValue];
+
+      values.forEach((value) => {
+        if (value === undefined || value === null) return;
+
+        vitvliFields.push({
+          key: String(key),
+          value: String(value),
+        });
+      });
+    });
+
+    const vitvliPayload = {
+      ...payload,
+      fields: vitvliFields,
+    };
+
     const response = await fetch(VITVLI_CONTACT_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Accept: "application/json, text/plain, */*",
       },
-      body: JSON.stringify(payload),
+      body: JSON.stringify(vitvliPayload),
     });
 
     const responseText = await response.text();

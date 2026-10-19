@@ -1003,6 +1003,57 @@ app.post("/api/meta/purchase", async (req, res) => {
   }
 });
 
+
+const VITVLI_CONTACT_URL = "https://vitvli.com/api/shopify/contact?sourceId=11";
+
+app.post("/api/vitvli-contact", async (req, res) => {
+  try {
+    if (!isMyPianoRequest(req)) {
+      return res.status(403).json({ ok: false, error: "Source not allowed" });
+    }
+
+    const payload = req.body && typeof req.body === "object" ? req.body : {};
+
+    if (!payload.fields || typeof payload.fields !== "object") {
+      return res.status(400).json({ ok: false, error: "Missing contact form fields" });
+    }
+
+    const response = await fetch(VITVLI_CONTACT_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json, text/plain, */*",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const responseText = await response.text();
+
+    console.log(
+      "VITVLI CONTACT:",
+      JSON.stringify({
+        status: response.status,
+        ok: response.ok,
+        response: responseText.slice(0, 1000),
+      })
+    );
+
+    if (!response.ok) {
+      return res.status(502).json({
+        ok: false,
+        error: "Vitvli contact API rejected the request",
+        upstream_status: response.status,
+        upstream_response: responseText.slice(0, 1000),
+      });
+    }
+
+    return res.json({ ok: true, upstream_status: response.status });
+  } catch (error) {
+    console.error("Vitvli contact error:", error);
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
 app.get("/test-payment", async (req, res) => {
   try {
     const bogOrder = await createTestBogOrder({ amount: 1 });
